@@ -1,15 +1,18 @@
 import os
+from tqdm import tqdm
 from typing import List, Optional, Tuple
 from collections import defaultdict
 from dataclasses import dataclass
-from dateutil.relativedelta import relativedelta
 
+from dateutil.relativedelta import relativedelta
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-DATA_URL = "https://datahub.io/core/s-and-p-500/r/0.csv"
+import yfinance
+
+INDEX_TAG = "^SPX"  # index-tag for S&P500 on Yahoo Finance
 TMP_FILE = "tmp.csv"
 
 
@@ -22,16 +25,20 @@ class Params:
     n_simulations: int
 
 
-def set_globals(**kwargs):
+def set_parameters(**kwargs):
     global PARAMS
     PARAMS = Params(**kwargs)
 
 
-def get_data() -> pd.DataFrame:
-    if not os.path.exists(TMP_FILE):
-        os.system(f"curl -L {DATA_URL} > {TMP_FILE}")
-    df = pd.read_csv("tmp.csv")
-    df = df[["Date", "SP500"]].rename({"SP500": "Price"}, axis=1)
+def get_data(cache: bool = True) -> pd.DataFrame:
+    """Load data. Modify this function to use data from a different source."""
+    if not cache or not os.path.exists(TMP_FILE):
+        print(f"downloading historical data from yahoo finance: index = '{INDEX_TAG}'")
+        df = yfinance.download(INDEX_TAG).reset_index()  # max time-frame by default
+        df.to_csv(TMP_FILE, index=False)
+
+    df = pd.read_csv(TMP_FILE)
+    df = df.rename({"Close": "Price"}, axis=1)[["Date", "Price"]]
     df.Date = pd.to_datetime(df.Date)
     return df
 
@@ -51,10 +58,13 @@ def add_multiple(df: pd.DataFrame) -> pd.DataFrame:
     for _, row in df.iloc[1:].iterrows():
         end = row.Price
 
-        daily_return = (end - balance) / balance
-        multiple = 1 + daily_return
-        multiples.append(multiple)
+        if balance <= 0:
+            multiple = 0
+        else:
+            daily_return = (end - balance) / balance
+            multiple = 1 + daily_return
 
+        multiples.append(multiple)
         balance = balance * multiple
 
     df["multiple"] = multiples
@@ -82,7 +92,7 @@ def calculate_returns(df: pd.DataFrame, leverage: float = 1) -> List[float]:
 def run_simulation(df: pd.DataFrame, y_max_quantile_limit: Optional[float] = None):
     results = defaultdict(list)
 
-    for _ in range(PARAMS.n_simulations):
+    for _ in tqdm(range(PARAMS.n_simulations), desc="Running simulations"):
         time_frame = get_random_time_span(df)
         for leverage in set(PARAMS.leverage_values).union([1]):
             multiple = (
@@ -95,18 +105,27 @@ def run_simulation(df: pd.DataFrame, y_max_quantile_limit: Optional[float] = Non
 
     plot_outcome_distribution(
         results_df,
-        y_limit=results[max(PARAMS.leverage_values)] if y_max_quantile_limit else None,
+        y_limit_quantile=y_max_quantile_limit,
     )
     plot_minimum_multiples(results_df)
     plot_fraction_of_outcomes_worse_than_reference(results)
 
 
-def plot_outcome_distribution(results_df: pd.DataFrame, y_limit: Optional[float]):
+def plot_outcome_distribution(
+    results_df: pd.DataFrame, y_limit_quantile: Optional[float]
+):
     fig, ax = plt.subplots()
     sns.boxplot(x="leverage", y="multiple", data=results_df, ax=ax)
     ax.set_title(f"Distributions of outcomes after {PARAMS.n_years} years")
-    if y_limit:
-        ax.set_ylim(0, np.quantile(y_limit, q=0.9))
+    if y_limit_quantile:
+        leverage_with_largest_multiple = results_df.at[
+            results_df.multiple.idxmax(), "leverage"
+        ]
+        ylim = np.quantile(
+            results_df[results_df.leverage == leverage_with_largest_multiple].multiple,
+            q=y_limit_quantile,
+        )
+        ax.set_ylim(0, ylim)
     plt.show()
 
 
@@ -125,16 +144,18 @@ def plot_minimum_multiples(results_df: pd.DataFrame):
 
 def plot_fraction_of_outcomes_worse_than_reference(results: defaultdict[int, list]):
     reference = np.array(results[1])
-    fract_below_ref = [
-        (k, np.mean(np.array(v) < reference)) for k, v in results.items() if k != 1
+    percentage_below_ref = [
+        (k, np.mean(np.array(v) < reference) * 100)
+        for k, v in results.items()
+        if k != 1
     ]
+    df = pd.DataFrame(percentage_below_ref, columns=["leverage", "percent_of_outcomes"])
     sns.barplot(
         x="leverage",
-        y="fraction_of_outcomes",
-        data=pd.DataFrame(
-            fract_below_ref, columns=["leverage", "fraction_of_outcomes"]
-        ),
+        y="percent_of_outcomes",
+        data=df,
     )
+    plt.ylim(0, 100)
     plt.title("Fraction outcomes worse than non-leveraged")
     plt.show()
 
